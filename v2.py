@@ -62,17 +62,56 @@ SELL_SIGNALS = {
 #  INDICATOR FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def send_telegram_alert(msg: str) -> bool:
+def _tg_escape(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
+    # Characters that must be escaped in MarkdownV2 plain text
+    specials = r"\_*[]()~`>#+-=|{}.!"
+    for ch in specials:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+def send_telegram_alert(msg: str) -> tuple:
+    """
+    Send a plain-text message via Telegram Bot API.
+    Returns (success: bool, error_msg: str).
+    Uses POST + plain text (no parse_mode) to avoid escaping issues.
+    """
     if not (BOT_TOKEN and CHAT_ID):
-        return False
+        return False, "Telegram 未設定（請在 secrets.toml 中設定 BOT_TOKEN 和 CHAT_ID）"
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": msg,
-                   "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.get(url, params=payload, timeout=10)
-        return r.status_code == 200 and r.json().get("ok", False)
+        url     = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id":                  CHAT_ID,
+            "text":                     msg,
+            "disable_web_page_preview": True,
+            "disable_notification":     False,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        resp = r.json()
+        if r.status_code == 200 and resp.get("ok"):
+            return True, ""
+        else:
+            err = resp.get("description", f"HTTP {r.status_code}")
+            return False, f"Telegram API 錯誤：{err}"
+    except requests.exceptions.Timeout:
+        return False, "Telegram 發送逾時（15 秒）"
+    except Exception as e:
+        return False, f"Telegram 發送例外：{e}"
+
+
+def _fmt_vol(vol) -> str:
+    """Format volume as readable string: 1,234,567 → 1.23M"""
+    try:
+        v = float(vol)
+        if v >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        elif v >= 1_000:
+            return f"{v/1_000:.1f}K"
+        else:
+            return f"{v:.0f}"
     except Exception:
-        return False
+        return str(vol)
 
 
 def calculate_macd(df, fast=12, slow=26, signal=9):
@@ -1085,12 +1124,23 @@ for tab_idx, ticker in enumerate(selected_tickers):
             K_str  = str(data["異動標記"].iloc[-1])
             K_list = [s.strip() for s in K_str.split(", ") if s.strip()]
 
-            # Selected signal push
+            # ── Selected-signal push (user-chosen signals) ────────────────
             for sig in selected_signals:
                 if sig in K_list:
-                    send_telegram_alert(
-                        f"📡 {ticker} 信號「{sig}」"
-                        f" @ ${cur_price:.2f} | RSI={data['RSI'].iloc[-1]:.1f}")
+                    _msg = (
+                        f"📡 信號提醒\n"
+                        f"股票：{ticker} ({selected_interval})\n"
+                        f"信號：{sig}\n"
+                        f"價格：${cur_price:.2f}\n"
+                        f"RSI：{data['RSI'].iloc[-1]:.1f}  MACD：{data['MACD'].iloc[-1]:.3f}\n"
+                        f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  "
+                        f"({data['成交量標記'].iloc[-1]})"
+                    )
+                    _ok, _err = send_telegram_alert(_msg)
+                    if _ok:
+                        st.toast(f"📡 Telegram 已推送：{sig}", icon="✅")
+                    else:
+                        st.warning(f"⚠️ Telegram 推送失敗（{sig}）：{_err}")
 
             # matched_rank: read live table from session_state (updated by backtest)
             matched_rank = None
@@ -1110,22 +1160,97 @@ for tab_idx, ticker in enumerate(selected_tickers):
                     break
 
             if matched_rank is not None:
-                _alert_lines = [
-                    "🟢 趨勢反轉買入信號",
-                    f"📌 {ticker} ({selected_interval})",
-                    f"💰 ${cur_price:.2f}",
-                    f"📊 {K_str[:150]}",
-                    f"📦 成交量：{_cur_vol}",
-                    f"🕯 K線：{_cur_kline}",
-                    f"🏆 排名 {matched_rank}  回測勝率 {matched_backtest_wr}",
-                ]
-                send_telegram_alert("\n".join(_alert_lines))
+                # ── Build rich Telegram message ────────────────────────────
+                _rsi_val  = data["RSI"].iloc[-1]
+                _macd_val = data["MACD"].iloc[-1]
+                _sig_line = data["Signal_Line"].iloc[-1] if "Signal_Line" in data.columns else 0
+                _vix_val  = data["VIX"].iloc[-1]
+                _vix_str  = f"{_vix_val:.1f}" if pd.notna(_vix_val) else "N/A"
+                _near_str = near_dense_info if near_dense else "無密集區靠近"
 
-            # Breakout/breakdown alerts
+                # Direction indicator
+                _dir_icon = "🟢" if px_pct >= 0 else "🔴"
+                _rsi_icon = "🔥" if _rsi_val > 70 else ("🧊" if _rsi_val < 30 else "⚪")
+                _vol_icon = "📈" if _cur_vol == "放量" else "📉"
+
+                _tg_lines = [
+                    f"{'='*28}",
+                    f"🚨 Telegram 觸發條件匹配",
+                    f"{'='*28}",
+                    f"",
+                    f"股票代號  : {ticker}",
+                    f"時間框架  : {selected_interval}",
+                    f"觸發時間  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"",
+                    f"--- 價格資訊 ---",
+                    f"現價      : ${cur_price:.2f}  {_dir_icon} {px_pct:+.2f}%",
+                    f"成交量    : {_fmt_vol(data['Volume'].iloc[-1])}  {_vol_icon} {_cur_vol}  ({v_pct:+.1f}%)",
+                    f"",
+                    f"--- 技術指標 ---",
+                    f"RSI       : {_rsi_val:.1f}  {_rsi_icon}",
+                    f"MACD      : {_macd_val:.4f}  (Signal: {_sig_line:.4f})",
+                    f"K線形態   : {_cur_kline}",
+                    f"VIX       : {_vix_str}",
+                    f"密集區    : {_near_str}",
+                    f"",
+                    f"--- 觸發信號 ---",
+                ]
+                # Split signals to multiple lines for readability
+                for _s in K_list[:12]:
+                    _tg_lines.append(f"  {_s}")
+                if len(K_list) > 12:
+                    _tg_lines.append(f"  ... 共 {len(K_list)} 個信號")
+                _tg_lines += [
+                    f"",
+                    f"--- 匹配條件 ---",
+                    f"條件排名  : #{matched_rank}",
+                    f"回測勝率  : {matched_backtest_wr}",
+                    f"{'='*28}",
+                ]
+                _full_msg = "\n".join(_tg_lines)
+                _ok, _err = send_telegram_alert(_full_msg)
+
+                # ── UI feedback ────────────────────────────────────────────
+                if _ok:
+                    st.success(
+                        f"📨 **Telegram 已發送！** 條件排名 #{matched_rank}，"
+                        f"回測勝率 {matched_backtest_wr}",
+                        icon="✅",
+                    )
+                    st.toast(f"✅ {ticker} 條件 #{matched_rank} 匹配，Telegram 已推送", icon="📨")
+                else:
+                    st.error(
+                        f"❌ Telegram 發送失敗（條件 #{matched_rank} 已匹配）：{_err}\n\n"
+                        f"請檢查 secrets.toml 中的 BOT_TOKEN 和 CHAT_ID 是否正確。",
+                        icon="🚨",
+                    )
+
+            # ── Breakout / Breakdown alerts ────────────────────────────────
             if pd.notna(data["High_Max"].iloc[-1]) and data["High"].iloc[-1] >= data["High_Max"].iloc[-1]:
-                send_telegram_alert(f"🚀 {ticker} 破 {W}K 新高 ${data['High'].iloc[-1]:.2f}")
+                _bo_msg = (
+                    f"🚀 突破新高提醒\n"
+                    f"股票：{ticker} ({selected_interval})\n"
+                    f"現價 ${data['High'].iloc[-1]:.2f} 創 {W} 根K線新高\n"
+                    f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  ({_cur_vol})"
+                )
+                _ok, _err = send_telegram_alert(_bo_msg)
+                if _ok:
+                    st.toast(f"🚀 {ticker} 破 {W}K 新高，Telegram 已推送", icon="🚀")
+                else:
+                    st.warning(f"⚠️ {ticker} 突破新高 Telegram 推送失敗：{_err}")
+
             if pd.notna(data["Low_Min"].iloc[-1]) and data["Low"].iloc[-1] <= data["Low_Min"].iloc[-1]:
-                send_telegram_alert(f"🔻 {ticker} 穿 {W}K 新低 ${data['Low'].iloc[-1]:.2f}")
+                _bd_msg = (
+                    f"🔻 跌破新低提醒\n"
+                    f"股票：{ticker} ({selected_interval})\n"
+                    f"現價 ${data['Low'].iloc[-1]:.2f} 創 {W} 根K線新低\n"
+                    f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  ({_cur_vol})"
+                )
+                _ok, _err = send_telegram_alert(_bd_msg)
+                if _ok:
+                    st.toast(f"🔻 {ticker} 穿 {W}K 新低，Telegram 已推送", icon="🔻")
+                else:
+                    st.warning(f"⚠️ {ticker} 跌破新低 Telegram 推送失敗：{_err}")
 
             # Email (consolidated)
             sig_dict = {
@@ -1382,10 +1507,16 @@ with tabs[-1]:
 
             added = len(combined) - len(
                 existing.drop_duplicates(subset=["異動標記","成交量標記","K線形態"]))
+            _added_n = max(added, 0)
             st.success(
-                f"✅ 已追加 **{max(added,0)}** 條新組合（去重後共 {len(combined)} 條）。"
-                "請捲動至頁面頂部的「📋 Telegram 觸發條件配置」查看，"
-                "系統匹配到相同條件時將自動發送 Telegram 交易信號。")
+                f"✅ 已追加 **{_added_n}** 條新組合（去重後共 **{len(combined)}** 條）。\n\n"
+                "📋 請捲動至頁面頂部的「**Telegram 觸發條件配置**」表格查看。\n\n"
+                "系統每次刷新時，會自動比對最新一根K線是否符合條件表中的任何一條。\n"
+                "一旦匹配，立即透過 Telegram 發送包含「現價、信號、RSI、MACD、"
+                "K線形態、回測勝率」的完整交易信號。"
+            )
+            if _added_n == 0:
+                st.info("ℹ️ 所有高勝率組合均已存在條件表中（無新增），去重後保留最新版本。")
 
         # ── Render 3 dimensions in tabs ────────────────────────────────────
         dim_tab1, dim_tab2, dim_tab3 = st.tabs([
