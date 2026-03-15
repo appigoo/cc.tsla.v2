@@ -275,47 +275,150 @@ def send_email_alert(ticker: str, price_pct: float, volume_pct: float, active_si
 #  BACKTEST: combination win-rate
 # ═════════════════════════════════════════════════════════════════════════════
 
-def backtest_signal_combinations(df: pd.DataFrame, min_combo=2,
-                                  max_combo=4, min_occ=3) -> pd.DataFrame:
+def _calc_wr(sub: "pd.DataFrame", is_sell: bool) -> float:
+    """Helper: win rate for a subset."""
+    if len(sub) == 0:
+        return 0.0
+    return (1 - sub["_next_up"].mean()) * 100 if is_sell else sub["_next_up"].mean() * 100
+
+
+def _base_signal_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                         min_occ: int) -> "pd.DataFrame":
     """
-    For every combination of signals (size min_combo..max_combo),
-    compute the win-rate = P(next_close > current_close | all signals present).
+    維度 1：純信號組合勝率
+    回傳欄位：信號組合, 信號數量, 勝率(%), 出現次數, 方向
     """
     df = df.copy()
     df["_next_up"] = df["Close"].shift(-1) > df["Close"]
     signal_sets = []
     for marks in df["異動標記"].fillna(""):
-        sigs = {s.strip() for s in str(marks).split(", ") if s.strip() and "🔥" not in s}
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
         signal_sets.append(sigs)
     df["_sigs"] = signal_sets
-
-    all_s = set()
-    for s in signal_sets:
-        all_s.update(s)
-    all_s = sorted(all_s)
+    all_s = sorted({s for ss in signal_sets for s in ss})
 
     rows = []
     for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
         for combo in combinations(all_s, r):
-            cs   = set(combo)
+            cs = set(combo)
             mask = df["_sigs"].apply(lambda s: cs.issubset(s))
             sub  = df[mask]
             if len(sub) < min_occ:
                 continue
-            sell_n = sum(1 for s in combo if s in SELL_SIGNALS)
-            is_sell = sell_n > len(combo) / 2
-            wr = (1 - sub["_next_up"].mean()) * 100 if is_sell else sub["_next_up"].mean() * 100
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
             rows.append({
-                "信號組合":  " + ".join(combo),
-                "信號數量":  r,
-                "勝率(%)":   round(wr, 1),
-                "出現次數":  len(sub),
-                "方向":      "做空" if is_sell else "做多",
+                "維度":     "信號組合",
+                "信號組合": " + ".join(combo),
+                "成交量標記": "—",
+                "K線形態":  "—",
+                "信號數量": r,
+                "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                "出現次數": len(sub),
+                "方向":     "做空" if is_sell else "做多",
             })
-
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+def _signal_x_volume_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                              min_occ: int) -> "pd.DataFrame":
+    """
+    維度 2：信號組合 × 成交量標記（放量 / 縮量）
+    回傳欄位同上，成交量標記填實際值
+    """
+    if "成交量標記" not in df.columns:
+        return pd.DataFrame()
+    df = df.copy()
+    df["_next_up"] = df["Close"].shift(-1) > df["Close"]
+    signal_sets = []
+    for marks in df["異動標記"].fillna(""):
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
+        signal_sets.append(sigs)
+    df["_sigs"] = signal_sets
+    all_s = sorted({s for ss in signal_sets for s in ss})
+
+    rows = []
+    for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
+        for combo in combinations(all_s, r):
+            cs = set(combo)
+            base_mask = df["_sigs"].apply(lambda s: cs.issubset(s))
+            base_sub  = df[base_mask]
+            if len(base_sub) < min_occ:
+                continue
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
+            for vol_label in ["放量", "縮量"]:
+                sub = base_sub[base_sub["成交量標記"] == vol_label]
+                if len(sub) < min_occ:
+                    continue
+                rows.append({
+                    "維度":     "信號+成交量",
+                    "信號組合": " + ".join(combo),
+                    "成交量標記": vol_label,
+                    "K線形態":  "—",
+                    "信號數量": r,
+                    "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                    "出現次數": len(sub),
+                    "方向":     "做空" if is_sell else "做多",
+                })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+def _signal_x_kline_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                             min_occ: int) -> "pd.DataFrame":
+    """
+    維度 3：信號組合 × K線形態
+    回傳欄位同上，K線形態填實際值
+    """
+    if "K線形態" not in df.columns:
+        return pd.DataFrame()
+    df = df.copy()
+    df["_next_up"] = df["Close"].shift(-1) > df["Close"]
+    signal_sets = []
+    for marks in df["異動標記"].fillna(""):
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
+        signal_sets.append(sigs)
+    df["_sigs"] = signal_sets
+    all_s = sorted({s for ss in signal_sets for s in ss})
+    kline_vals = [k for k in df["K線形態"].dropna().unique() if k and k != "普通K線"]
+
+    rows = []
+    for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
+        for combo in combinations(all_s, r):
+            cs = set(combo)
+            base_mask = df["_sigs"].apply(lambda s: cs.issubset(s))
+            base_sub  = df[base_mask]
+            if len(base_sub) < min_occ:
+                continue
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
+            for kl in kline_vals:
+                sub = base_sub[base_sub["K線形態"] == kl]
+                if len(sub) < min_occ:
+                    continue
+                rows.append({
+                    "維度":     "信號+K線形態",
+                    "信號組合": " + ".join(combo),
+                    "成交量標記": "—",
+                    "K線形態":  kl,
+                    "信號數量": r,
+                    "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                    "出現次數": len(sub),
+                    "方向":     "做空" if is_sell else "做多",
+                })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+def backtest_signal_combinations(df: "pd.DataFrame", min_combo=2,
+                                  max_combo=4, min_occ=3) -> "pd.DataFrame":
+    """保留舊介面相容：只跑維度1（純信號組合）。回測 Tab 直接呼叫三個子函數。"""
+    return _base_signal_combos(df, min_combo, max_combo, min_occ)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -660,9 +763,10 @@ selected_signals = st.multiselect("選擇需要 Telegram 推播的信號",
 
 # ── Telegram conditions table ─────────────────────────────────────────────────
 st.subheader("📋 Telegram 觸發條件配置（可編輯）")
-default_conds = pd.DataFrame({
-    "排名":     ["1","2","3","4","5"],
-    "異動標記": [
+
+_TG_DEFAULT = pd.DataFrame({
+    "排名":       ["1","2","3","4","5"],
+    "異動標記":   [
         "📈 價格趨勢買入, 📈 持續跳空(上), 📈 SMA50上升趨勢, 📈 OBV突破買入",
         "📈 Low>High, 📈 價格趨勢買入, 📈 SMA50上升趨勢",
         "📈 連續向上買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
@@ -670,18 +774,28 @@ default_conds = pd.DataFrame({
         "📈 EMA買入, 📈 連續向上買入, 📈 SMA50上升趨勢",
     ],
     "成交量標記": ["放量","縮量","放量","放量","縮量"],
-    "K線形態":   ["大陽線","普通K線","大陽線","射擊之星","看漲吞噬"],
+    "K線形態":    ["大陽線","普通K線","大陽線","射擊之星","看漲吞噬"],
+    "回測勝率":   ["N/A","N/A","N/A","N/A","N/A"],
 })
+if "tg_conds" not in st.session_state:
+    st.session_state["tg_conds"] = _TG_DEFAULT.copy()
+
 telegram_conditions = st.data_editor(
-    default_conds, num_rows="dynamic",
+    st.session_state["tg_conds"],
+    num_rows="dynamic",
+    key="tg_editor",
     column_config={
-        "排名":       st.column_config.TextColumn("排名"),
-        "異動標記":   st.column_config.TextColumn("異動標記"),
-        "成交量標記": st.column_config.SelectboxColumn("成交量標記", options=["放量","縮量"]),
-        "K線形態":    st.column_config.TextColumn("K線形態"),
+        "排名":       st.column_config.TextColumn("排名", width="small"),
+        "異動標記":   st.column_config.TextColumn("異動標記", width="large"),
+        "成交量標記": st.column_config.SelectboxColumn("成交量標記",
+                        options=["放量","縮量","—"], width="small"),
+        "K線形態":    st.column_config.TextColumn("K線形態", width="medium"),
+        "回測勝率":   st.column_config.TextColumn("回測勝率", width="small",
+                        help="由回測一鍵加入時自動填入"),
     },
     use_container_width=True,
 )
+st.session_state["tg_conds"] = telegram_conditions
 
 st.title("📊 股票監控儀表板")
 st.caption(f"⏱ 更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -978,21 +1092,34 @@ for tab_idx, ticker in enumerate(selected_tickers):
                         f"📡 {ticker} 信號「{sig}」"
                         f" @ ${cur_price:.2f} | RSI={data['RSI'].iloc[-1]:.1f}")
 
-            # FIX: matched_rank initialised to None BEFORE condition checks
+            # matched_rank: read live table from session_state (updated by backtest)
             matched_rank = None
-            for _, cond_row in telegram_conditions.iterrows():
+            matched_backtest_wr = "N/A"
+            _live_tg = st.session_state.get("tg_conds", telegram_conditions)
+            _cur_vol   = data["成交量標記"].iloc[-1]
+            _cur_kline = data["K線形態"].iloc[-1]
+            for _, cond_row in _live_tg.iterrows():
                 req = [s.strip() for s in str(cond_row["異動標記"]).split(", ") if s.strip()]
-                if (all(s in K_list for s in req) and
-                        data["成交量標記"].iloc[-1] == cond_row["成交量標記"] and
-                        data["K線形態"].iloc[-1]  == cond_row["K線形態"]):
+                c_vol   = str(cond_row.get("成交量標記", "—"))
+                c_kline = str(cond_row.get("K線形態",    "普通K線"))
+                vol_ok   = (c_vol   in ("—", _cur_vol))
+                kline_ok = (c_kline in ("—", _cur_kline))
+                if all(s in K_list for s in req) and vol_ok and kline_ok:
                     matched_rank = cond_row["排名"]
+                    matched_backtest_wr = cond_row.get("回測勝率", "N/A")
                     break
 
             if matched_rank is not None:
-                send_telegram_alert(
-                    f"🟢 趨勢反轉買入 {ticker}:{selected_interval} "
-                    f"${cur_price:.2f} | {K_str[:120]} | "
-                    f"{data['成交量標記'].iloc[-1]} | {data['K線形態'].iloc[-1]} | 排名:{matched_rank}")
+                _alert_lines = [
+                    "🟢 趨勢反轉買入信號",
+                    f"📌 {ticker} ({selected_interval})",
+                    f"💰 ${cur_price:.2f}",
+                    f"📊 {K_str[:150]}",
+                    f"📦 成交量：{_cur_vol}",
+                    f"🕯 K線：{_cur_kline}",
+                    f"🏆 排名 {matched_rank}  回測勝率 {matched_backtest_wr}",
+                ]
+                send_telegram_alert("\n".join(_alert_lines))
 
             # Breakout/breakdown alerts
             if pd.notna(data["High_Max"].iloc[-1]) and data["High"].iloc[-1] >= data["High_Max"].iloc[-1]:
@@ -1035,33 +1162,49 @@ for tab_idx, ticker in enumerate(selected_tickers):
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tabs[-1]:
-    st.header("🔬 回測：組合信號勝率分析")
-    st.info("""
-    **分析哪些技術指標同時出現時勝率最高**
-    - 做多勝率 = 信號出現後下一根 K 線收漲的比例
-    - 做空勝率 = 信號出現後下一根 K 線收跌的比例
-    - ⚠️ 回測僅供參考，請結合風險管理進行決策
-    """)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  BACKTEST TAB  v2: 3 independent dimensions
+    # ══════════════════════════════════════════════════════════════════════════
+    st.header("🔬 回測：三維信號勝率分析")
 
+    st.info(
+        "**三個維度分開計算，找出歷史勝率最高的組合**\n\n"
+        "| 維度 | 說明 |\n"
+        "|------|------|\n"
+        "| 📊 信號組合 | 多個技術指標同時出現（基礎維度）|\n"
+        "| 📦 信號+成交量 | 信號組合 × 放量/縮量 |\n"
+        "| 🕯️ 信號+K線形態 | 信號組合 × K線形態（大陽線、錘子線…）|\n\n"
+        "三個維度**各自獨立計算**，讓您分別看到量能與K線結構如何提升勝率。\n"
+        "⚠️ 回測僅供參考，請結合風險管理進行決策。"
+    )
+
+    # ── Parameters ────────────────────────────────────────────────────────────
     bt_ticker = st.selectbox("選擇回測股票", selected_tickers, key="bt_ticker")
-    col_a, col_b, col_c = st.columns(3)
-    bt_min = col_a.number_input("最少組合數", 2, 3, int(BT_MIN_COMBO), 1, key="bt_min")
-    bt_max = col_b.number_input("最多組合數", 2, 5, int(BT_MAX_COMBO), 1, key="bt_max")
-    bt_occ = col_c.number_input("最少出現次數", 2, 20, int(BT_MIN_OCC), 1, key="bt_occ")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    bt_min    = col_a.number_input("最少信號組合數", 2, 3, int(BT_MIN_COMBO), 1, key="bt_min")
+    bt_max    = col_b.number_input("最多信號組合數", 2, 5, int(BT_MAX_COMBO), 1, key="bt_max")
+    bt_occ    = col_c.number_input("最少出現次數",   2, 20, int(BT_MIN_OCC),  1, key="bt_occ")
+    bt_wr_thr = col_d.number_input("高勝率閾值 (%)", 50, 95, 60, 5, key="bt_wr_thr",
+                                    help="高於此值才列入高勝率區，並可一鍵加入 Telegram 條件")
 
     if st.button("🚀 開始回測", type="primary"):
-        with st.spinner(f"正在計算 {bt_ticker} 信號組合勝率..."):
+        with st.spinner(f"正在計算 {bt_ticker} 三維勝率，稍候…"):
             try:
+                # ── Prepare data ──────────────────────────────────────────
                 bt_data = yf.Ticker(bt_ticker).history(
                     period=selected_period, interval=selected_interval).reset_index()
                 if "Date" in bt_data.columns:
                     bt_data = bt_data.rename(columns={"Date": "Datetime"})
                 bt_data["Datetime"] = pd.to_datetime(bt_data["Datetime"]).dt.tz_localize(None)
-                bt_data["前5均量"]   = bt_data["Volume"].rolling(5).mean()
+                if len(bt_data) < 30:
+                    st.warning("資料不足（< 30 根K線），請選擇更長時間範圍。")
+                    st.stop()
+
+                bt_data["前5均量"]         = bt_data["Volume"].rolling(5).mean()
                 bt_data["Price Change %"]  = bt_data["Close"].pct_change() * 100
                 bt_data["Volume Change %"] = bt_data["Volume"].pct_change() * 100
                 bt_data["MACD"], bt_data["Signal_Line"], _ = calculate_macd(bt_data)
-                bt_data["RSI"]    = calculate_rsi(bt_data)
+                bt_data["RSI"] = calculate_rsi(bt_data)
                 for span, name in [(5,"EMA5"),(10,"EMA10"),(30,"EMA30"),(40,"EMA40")]:
                     bt_data[name] = bt_data["Close"].ewm(span=span, adjust=False).mean()
                 bt_data["SMA50"]  = bt_data["Close"].rolling(50).mean()
@@ -1071,8 +1214,10 @@ with tabs[-1]:
                 bt_data["OBV"]    = calculate_obv(bt_data)
                 bt_data["Up"]   = (bt_data["Close"] > bt_data["Close"].shift(1)).astype(int)
                 bt_data["Down"] = (bt_data["Close"] < bt_data["Close"].shift(1)).astype(int)
-                bt_data["Continuous_Up"]   = bt_data["Up"]   * (bt_data["Up"].groupby(   (bt_data["Up"]   == 0).cumsum()).cumcount() + 1)
-                bt_data["Continuous_Down"] = bt_data["Down"] * (bt_data["Down"].groupby( (bt_data["Down"] == 0).cumsum()).cumcount() + 1)
+                bt_data["Continuous_Up"]   = bt_data["Up"] * (
+                    bt_data["Up"].groupby((bt_data["Up"] == 0).cumsum()).cumcount() + 1)
+                bt_data["Continuous_Down"] = bt_data["Down"] * (
+                    bt_data["Down"].groupby((bt_data["Down"] == 0).cumsum()).cumcount() + 1)
                 W2 = int(MFI_WIN)
                 bt_data["High_Max"]       = bt_data["High"].rolling(W2).max()
                 bt_data["Low_Min"]        = bt_data["Low"].rolling(W2).min()
@@ -1080,75 +1225,215 @@ with tabs[-1]:
                 bt_data["Close_Roll_Min"] = bt_data["Close"].rolling(W2).min()
                 bt_data["MFI_Roll_Max"]   = bt_data["MFI"].rolling(W2).max()
                 bt_data["MFI_Roll_Min"]   = bt_data["MFI"].rolling(W2).min()
-                bt_data["MFI_Bear_Div"]   = (bt_data["Close"] == bt_data["Close_Roll_Max"]) & (bt_data["MFI"] < bt_data["MFI_Roll_Max"].shift(1))
-                bt_data["MFI_Bull_Div"]   = (bt_data["Close"] == bt_data["Close_Roll_Min"]) & (bt_data["MFI"] > bt_data["MFI_Roll_Min"].shift(1))
-                bt_data["OBV_Roll_Max"]   = bt_data["OBV"].rolling(20).max()
-                bt_data["OBV_Roll_Min"]   = bt_data["OBV"].rolling(20).min()
-                bt_data["VIX"] = np.nan; bt_data["VIX_EMA_Fast"] = np.nan; bt_data["VIX_EMA_Slow"] = np.nan
-                bt_data["📈 股價漲跌幅(%)"]   = np.nan
-                bt_data["📊 成交量變動幅(%)"] = np.nan
-                bt_data["Close_N_High"] = np.nan; bt_data["Close_N_Low"] = np.nan
+                bt_data["MFI_Bear_Div"]   = (
+                    (bt_data["Close"] == bt_data["Close_Roll_Max"]) &
+                    (bt_data["MFI"] < bt_data["MFI_Roll_Max"].shift(1)))
+                bt_data["MFI_Bull_Div"]   = (
+                    (bt_data["Close"] == bt_data["Close_Roll_Min"]) &
+                    (bt_data["MFI"] > bt_data["MFI_Roll_Min"].shift(1)))
+                bt_data["OBV_Roll_Max"] = bt_data["OBV"].rolling(20).max()
+                bt_data["OBV_Roll_Min"] = bt_data["OBV"].rolling(20).min()
+                for _nc in ["VIX","VIX_EMA_Fast","VIX_EMA_Slow",
+                             "📈 股價漲跌幅(%)","📊 成交量變動幅(%)",
+                             "Close_N_High","Close_N_Low"]:
+                    bt_data[_nc] = np.nan
 
-                data = bt_data  # needed for closure in compute_all_signals
+                data = bt_data  # closure for compute_all_signals
                 bt_data["異動標記"] = compute_all_signals(bt_data, PARAMS)
 
-                combo_df = backtest_signal_combinations(
-                    bt_data, min_combo=int(bt_min), max_combo=int(bt_max), min_occ=int(bt_occ))
+                # K線形態 & 成交量標記
+                _buster2 = str(round(float(bt_data["Close"].iloc[-1]), 4))
+                kdf2 = get_kline_patterns(bt_ticker, selected_period, selected_interval,
+                                          BODY_RATIO_TH, SHADOW_RATIO_TH, DOJI_BODY_TH, _buster2)
+                kdf2["Datetime"] = pd.to_datetime(kdf2["Datetime"]).dt.tz_localize(None)
+                bt_data = bt_data.merge(kdf2, on="Datetime", how="left")
+                bt_data["K線形態"]  = bt_data["K線形態"].fillna("普通K線")
+                bt_data["成交量標記"] = bt_data.apply(
+                    lambda r: "放量" if pd.notna(r["前5均量"]) and r["Volume"] > r["前5均量"]
+                    else "縮量", axis=1)
 
-                if combo_df.empty:
-                    st.warning("資料不足。請選擇更長的時間範圍（建議 1y 以上）。")
-                else:
-                    total_combos = len(combo_df)
-                    high_wr_df   = combo_df[combo_df["勝率(%)"] >= 60]
-                    st.success(f"✅ 共找到 {total_combos} 個有效組合，其中 {len(high_wr_df)} 個勝率 ≥ 60%")
+                _kw = dict(min_combo=int(bt_min), max_combo=int(bt_max), min_occ=int(bt_occ))
 
-                    if not high_wr_df.empty:
-                        st.subheader("🏆 高勝率組合（≥ 60%）")
-                        st.dataframe(
-                            high_wr_df.style.background_gradient(subset=["勝率(%)"], cmap="Greens"),
-                            use_container_width=True)
+                # ── Run 3 independent dimensions ──────────────────────────
+                df_sig  = _base_signal_combos(bt_data, **_kw)
+                df_vol  = _signal_x_volume_combos(bt_data, **_kw)
+                df_kl   = _signal_x_kline_combos(bt_data, **_kw)
 
-                    st.subheader("📊 全部組合排名")
-                    st.dataframe(
-                        combo_df.style.background_gradient(subset=["勝率(%)"], cmap="RdYlGn"),
-                        use_container_width=True)
-
-                    # Bar chart
-                    top15 = combo_df.head(15)
-                    bar_colors = ["#2ecc71" if d=="做多" else "#e74c3c" for d in top15["方向"]]
-                    fig_bt = go.Figure(go.Bar(
-                        x=top15["勝率(%)"],
-                        y=top15["信號組合"],
-                        orientation="h",
-                        marker_color=bar_colors,
-                        text=[f"{v:.1f}% ({n}次)" for v,n in zip(top15["勝率(%)"], top15["出現次數"])],
-                        textposition="outside",
-                    ))
-                    fig_bt.add_vline(x=60, line_dash="dash", line_color="gold",
-                                     annotation_text="60% 基準線")
-                    fig_bt.update_layout(
-                        title=f"{bt_ticker} 信號組合勝率排名（前 15）",
-                        xaxis_title="勝率 (%)", height=600,
-                        template="plotly_dark",
-                        margin=dict(l=350, r=80, t=60, b=40),
-                    )
-                    st.plotly_chart(fig_bt, use_container_width=True)
-
-                    # Advice
-                    st.subheader("💡 交易建議")
-                    if not high_wr_df.empty:
-                        best = high_wr_df.iloc[0]
-                        st.success(
-                            f"**最佳組合**：{best['信號組合']}\n\n"
-                            f"- 勝率：**{best['勝率(%)']}%**  |  出現次數：**{best['出現次數']}**  |  方向：**{best['方向']}**\n\n"
-                            "⚠️ 回測基於歷史數據，未來不保證相同表現。請結合基本面分析與嚴格止損策略。")
-                    else:
-                        st.info("目前無 ≥60% 勝率組合，建議延長時間範圍至 1y 以上，或調整信號參數。")
+                st.session_state["bt_df_sig"]     = df_sig
+                st.session_state["bt_df_vol"]     = df_vol
+                st.session_state["bt_df_kl"]      = df_kl
+                st.session_state["bt_wr_thr"]     = int(bt_wr_thr)
+                st.session_state["bt_ticker_lbl"] = bt_ticker
 
             except Exception as e:
                 st.error(f"回測失敗：{e}")
                 with st.expander("詳細錯誤"):
                     st.code(traceback.format_exc())
+
+    # ── Results (persist via session_state) ───────────────────────────────────
+    if "bt_df_sig" in st.session_state:
+        df_sig  = st.session_state["bt_df_sig"]
+        df_vol  = st.session_state["bt_df_vol"]
+        df_kl   = st.session_state["bt_df_kl"]
+        _wr_thr = st.session_state.get("bt_wr_thr", 60)
+        _bt_lbl = st.session_state.get("bt_ticker_lbl", bt_ticker)
+
+        # ── Helper: render one dimension result ───────────────────────────
+        def _render_dim(df_dim: pd.DataFrame, title: str, wr_thr: int,
+                        col_order: list, dim_key: str):
+            if df_dim.empty:
+                st.warning(f"{title}：無有效組合，請增加時間範圍或降低最少出現次數。")
+                return
+
+            hi = df_dim[df_dim["勝率(%)"] >= wr_thr].copy()
+            total = len(df_dim)
+            st.success(f"✅ {title}：找到 **{total}** 組，其中 **{len(hi)}** 組勝率 ≥ {wr_thr}%")
+
+            # Summary row
+            m1, m2, m3 = st.columns(3)
+            m1.metric("最高勝率",   f"{df_dim['勝率(%)'].max():.1f}%")
+            m2.metric("平均勝率",   f"{df_dim['勝率(%)'].mean():.1f}%")
+            m3.metric(f"≥{wr_thr}%", len(hi))
+
+            # High win-rate table
+            if not hi.empty:
+                disp_cols = [c for c in col_order if c in hi.columns]
+                st.dataframe(
+                    hi[disp_cols].style.background_gradient(subset=["勝率(%)"], cmap="Greens"),
+                    use_container_width=True,
+                    height=min(400, 38 * (len(hi) + 1) + 40),
+                )
+
+                # ── ONE-CLICK ADD button ───────────────────────────────────
+                btn_label = f"➕ 一鍵加入 {title} 高勝率組合到 Telegram 條件"
+                if st.button(btn_label, key=f"add_{dim_key}", type="primary"):
+                    _one_click_add(hi, dim_key)
+
+            # Full table (collapsed)
+            with st.expander(f"📊 {title} 全部 {total} 組（展開查看）"):
+                disp_all = [c for c in col_order if c in df_dim.columns]
+                st.dataframe(
+                    df_dim[disp_all].style.background_gradient(subset=["勝率(%)"], cmap="RdYlGn"),
+                    use_container_width=True, height=420,
+                )
+
+            # Bar chart: top 12
+            top12 = df_dim.head(12).copy()
+            y_labels = []
+            for _, r in top12.iterrows():
+                vol_part   = f" [{r['成交量標記']}]" if r.get("成交量標記","—") != "—" else ""
+                kline_part = f" [{r['K線形態']}]"   if r.get("K線形態","—")   != "—" else ""
+                y_labels.append(r["信號組合"] + vol_part + kline_part)
+            bar_colors = ["#2ecc71" if d=="做多" else "#e74c3c" for d in top12["方向"]]
+            fig_d = go.Figure(go.Bar(
+                x=top12["勝率(%)"], y=y_labels, orientation="h",
+                marker_color=bar_colors,
+                text=[f"{v:.1f}% ({n}次)" for v,n in zip(top12["勝率(%)"],top12["出現次數"])],
+                textposition="outside",
+            ))
+            fig_d.add_vline(x=_wr_thr, line_dash="dash", line_color="gold",
+                            annotation_text=f"{_wr_thr}%")
+            fig_d.update_layout(
+                title=f"{_bt_lbl} — {title}（前12）",
+                xaxis_title="勝率 (%)", xaxis_range=[0, 115],
+                height=520, template="plotly_dark",
+                margin=dict(l=380, r=60, t=50, b=30),
+            )
+            st.plotly_chart(fig_d, use_container_width=True, key=f"chart_{dim_key}")
+
+        # ── One-click add helper (dedup + re-rank) ────────────────────────
+        def _one_click_add(hi_df: pd.DataFrame, dim_key: str):
+            """Append high-WR rows to tg_conds, dedup, re-rank by 勝率."""
+            existing = st.session_state.get("tg_conds", pd.DataFrame()).copy()
+            if "回測勝率" not in existing.columns:
+                existing["回測勝率"] = "N/A"
+
+            new_rows = []
+            for _, row in hi_df.iterrows():
+                vol   = row.get("成交量標記","—")
+                kl    = row.get("K線形態","普通K線")
+                new_rows.append({
+                    "排名":       "",
+                    "異動標記":   row["信號組合"].replace(" + ", ", "),
+                    "成交量標記": "—" if vol == "—" else vol,
+                    "K線形態":    kl,
+                    "回測勝率":   f"{row['勝率(%)']:.1f}%",
+                })
+            new_df = pd.DataFrame(new_rows)
+
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            # Dedup: same 異動標記+成交量標記+K線形態 → keep last (new wins)
+            combined = combined.drop_duplicates(
+                subset=["異動標記","成交量標記","K線形態"], keep="last")
+
+            # Re-rank by 勝率 descending
+            def _parse(v):
+                try:
+                    return float(str(v).replace("%","").strip())
+                except Exception:
+                    return 0.0
+            combined["_n"] = combined["回測勝率"].apply(_parse)
+            combined = combined.sort_values("_n", ascending=False).drop(columns=["_n"])
+            combined = combined.reset_index(drop=True)
+            combined["排名"] = [str(i+1) for i in range(len(combined))]
+
+            st.session_state["tg_conds"] = combined[
+                ["排名","異動標記","成交量標記","K線形態","回測勝率"]]
+
+            added = len(combined) - len(
+                existing.drop_duplicates(subset=["異動標記","成交量標記","K線形態"]))
+            st.success(
+                f"✅ 已追加 **{max(added,0)}** 條新組合（去重後共 {len(combined)} 條）。"
+                "請捲動至頁面頂部的「📋 Telegram 觸發條件配置」查看，"
+                "系統匹配到相同條件時將自動發送 Telegram 交易信號。")
+
+        # ── Render 3 dimensions in tabs ────────────────────────────────────
+        dim_tab1, dim_tab2, dim_tab3 = st.tabs([
+            "📊 維度一：信號組合",
+            "📦 維度二：信號 + 成交量",
+            "🕯️ 維度三：信號 + K線形態",
+        ])
+
+        COLS_SIG  = ["信號組合","信號數量","勝率(%)","出現次數","方向"]
+        COLS_VOL  = ["信號組合","成交量標記","信號數量","勝率(%)","出現次數","方向"]
+        COLS_KL   = ["信號組合","K線形態","信號數量","勝率(%)","出現次數","方向"]
+
+        with dim_tab1:
+            _render_dim(df_sig,  f"{_bt_lbl} 信號組合", _wr_thr, COLS_SIG, "sig")
+        with dim_tab2:
+            _render_dim(df_vol,  f"{_bt_lbl} 信號+成交量", _wr_thr, COLS_VOL, "vol")
+        with dim_tab3:
+            _render_dim(df_kl,   f"{_bt_lbl} 信號+K線形態", _wr_thr, COLS_KL, "kl")
+
+        # ── Best combo summary across all 3 dims ──────────────────────────
+        st.markdown("---")
+        st.subheader("💡 三維綜合最佳建議")
+        all_hi = []
+        for df_d, lbl in [(df_sig,"信號組合"),(df_vol,"信號+成交量"),(df_kl,"信號+K線形態")]:
+            hi_d = df_d[df_d["勝率(%)"] >= _wr_thr] if not df_d.empty else pd.DataFrame()
+            if not hi_d.empty:
+                best_row = hi_d.iloc[0].copy()
+                best_row["_dim"] = lbl
+                all_hi.append(best_row)
+
+        if all_hi:
+            overall_best = max(all_hi, key=lambda r: r["勝率(%)"])
+            vol_info   = (f"  成交量：**{overall_best.get('成交量標記','—')}**"
+                          if overall_best.get("成交量標記","—") != "—" else "")
+            kline_info = (f"  K線形態：**{overall_best.get('K線形態','—')}**"
+                          if overall_best.get("K線形態","—") != "—" else "")
+            st.success(
+                f"🏆 **全局最佳組合**（來自「{overall_best['_dim']}」維度）\n\n"
+                f"📊 信號：**{overall_best['信號組合']}**\n\n"
+                f"{vol_info}{kline_info}\n\n"
+                f"- 歷史勝率：**{overall_best['勝率(%)']}%**"
+                f"  |  出現次數：**{overall_best['出現次數']}**"
+                f"  |  方向：**{overall_best['方向']}**\n\n"
+                "⚠️ 回測基於歷史數據，未來不保證相同表現。請嚴格執行止損策略。"
+            )
+        else:
+            st.info(f"三個維度均無 ≥ {_wr_thr}% 勝率組合。建議延長時間範圍至 **1y** 以上，"
+                    "或降低高勝率閾值。")
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  AUTO REFRESH (FIX: replace while True + time.sleep with time.sleep + st.rerun)
