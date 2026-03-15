@@ -1142,21 +1142,51 @@ for tab_idx, ticker in enumerate(selected_tickers):
                     else:
                         st.warning(f"⚠️ Telegram 推送失敗（{sig}）：{_err}")
 
-            # matched_rank: read live table from session_state (updated by backtest)
-            matched_rank = None
+            # ── Condition matching ─────────────────────────────────────────
+            # Reads live table from session_state so backtest one-click adds take effect
+            def _safe_str(v) -> str:
+                """Convert cell value to string; treat None/NaN/nan/None-str as empty."""
+                if v is None:
+                    return ""
+                s = str(v).strip()
+                return "" if s.lower() in ("none", "nan", "nat", "") else s
+
+            matched_rank        = None   # will hold rank string after match
             matched_backtest_wr = "N/A"
-            _live_tg = st.session_state.get("tg_conds", telegram_conditions)
-            _cur_vol   = data["成交量標記"].iloc[-1]
-            _cur_kline = data["K線形態"].iloc[-1]
-            for _, cond_row in _live_tg.iterrows():
-                req = [s.strip() for s in str(cond_row["異動標記"]).split(", ") if s.strip()]
-                c_vol   = str(cond_row.get("成交量標記", "—"))
-                c_kline = str(cond_row.get("K線形態",    "普通K線"))
-                vol_ok   = (c_vol   in ("—", _cur_vol))
-                kline_ok = (c_kline in ("—", _cur_kline))
-                if all(s in K_list for s in req) and vol_ok and kline_ok:
-                    matched_rank = cond_row["排名"]
-                    matched_backtest_wr = cond_row.get("回測勝率", "N/A")
+            matched_cond_idx    = None   # row index in condition table
+
+            _live_tg   = st.session_state.get("tg_conds", telegram_conditions)
+            _cur_vol   = _safe_str(data["成交量標記"].iloc[-1])
+            _cur_kline = _safe_str(data["K線形態"].iloc[-1])
+
+            for _ci, cond_row in _live_tg.iterrows():
+                # ── 1. Parse required signals ──────────────────────────────
+                _raw_marks = _safe_str(cond_row.get("異動標記", ""))
+                if not _raw_marks:
+                    continue   # empty row, skip
+                req = [s.strip() for s in _raw_marks.split(",") if s.strip()]
+                if not req:
+                    continue
+
+                # ── 2. Volume filter (empty / "—" / "全部" = no restriction) ─
+                c_vol = _safe_str(cond_row.get("成交量標記", ""))
+                vol_ok = (c_vol == "") or (c_vol in ("—", "全部")) or (c_vol == _cur_vol)
+
+                # ── 3. K-line filter (empty / "—" / "全部" = no restriction) ─
+                c_kline = _safe_str(cond_row.get("K線形態", ""))
+                kline_ok = (c_kline == "") or (c_kline in ("—", "全部")) or (c_kline == _cur_kline)
+
+                # ── 4. Signal subset check ─────────────────────────────────
+                signals_ok = all(s in K_list for s in req)
+
+                if signals_ok and vol_ok and kline_ok:
+                    # Rank: use whatever is in the cell; if empty show row number
+                    _rank_raw = _safe_str(cond_row.get("排名", ""))
+                    matched_rank = _rank_raw if _rank_raw else f"#{_ci + 1}"
+                    # Win-rate
+                    _wr_raw = _safe_str(cond_row.get("回測勝率", ""))
+                    matched_backtest_wr = _wr_raw if _wr_raw else "N/A"
+                    matched_cond_idx = _ci
                     break
 
             if matched_rank is not None:
@@ -1208,22 +1238,39 @@ for tab_idx, ticker in enumerate(selected_tickers):
                     f"{'='*28}",
                 ]
                 _full_msg = "\n".join(_tg_lines)
+                # ── Always show match result on UI (regardless of Telegram) ──
+                st.info(
+                    f"🎯 **條件匹配！** 排名 {matched_rank}，回測勝率 {matched_backtest_wr}\n\n"
+                    f"信號：{K_str[:120]}\n"
+                    f"成交量：{_cur_vol}  K線：{_cur_kline}",
+                )
+
                 _ok, _err = send_telegram_alert(_full_msg)
 
-                # ── UI feedback ────────────────────────────────────────────
+                # ── Telegram send result ────────────────────────────────────
                 if _ok:
                     st.success(
-                        f"📨 **Telegram 已發送！** 條件排名 #{matched_rank}，"
+                        f"📨 **Telegram 已發送！** 條件排名 {matched_rank}，"
                         f"回測勝率 {matched_backtest_wr}",
                         icon="✅",
                     )
-                    st.toast(f"✅ {ticker} 條件 #{matched_rank} 匹配，Telegram 已推送", icon="📨")
-                else:
-                    st.error(
-                        f"❌ Telegram 發送失敗（條件 #{matched_rank} 已匹配）：{_err}\n\n"
-                        f"請檢查 secrets.toml 中的 BOT_TOKEN 和 CHAT_ID 是否正確。",
-                        icon="🚨",
+                    st.toast(
+                        f"✅ {ticker} 條件 {matched_rank} 匹配，Telegram 已推送",
+                        icon="📨",
                     )
+                else:
+                    if not (BOT_TOKEN and CHAT_ID):
+                        st.warning(
+                            f"⚠️ 條件已匹配但 **Telegram 未設定**，訊息未發送。\n\n"
+                            f"請在 `.streamlit/secrets.toml` 中設定 `BOT_TOKEN` 和 `CHAT_ID`。",
+                            icon="⚙️",
+                        )
+                    else:
+                        st.error(
+                            f"❌ **Telegram 發送失敗**（條件 {matched_rank} 已匹配）：{_err}\n\n"
+                            f"請確認 BOT_TOKEN / CHAT_ID 正確，且 Bot 已加入目標群組。",
+                            icon="🚨",
+                        )
 
             # ── Breakout / Breakdown alerts ────────────────────────────────
             if pd.notna(data["High_Max"].iloc[-1]) and data["High"].iloc[-1] >= data["High_Max"].iloc[-1]:
